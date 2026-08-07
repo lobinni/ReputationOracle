@@ -11,9 +11,9 @@ This is a **standalone Intelligent Contract** submission — not a project, not 
 |          |                                                                                           |
 | -------- | ----------------------------------------------------------------------------------------- |
 | Network  | StudioNet (chain id 61999)                                                                |
-| Address  | `0x855C4307De29B4895271fD7Da24cd039EDD19151`                                              |
-| Studio   | [Open in Studio](https://studio.genlayer.com/?import-contract=0x855C4307De29B4895271fD7Da24cd039EDD19151) |
-| Explorer | [View on Explorer](https://explorer-studio.genlayer.com/address/0x855C4307De29B4895271fD7Da24cd039EDD19151) |
+| Address  | `0xaF9BF312d933d528C8a67794f0691f1754ef1Ec0`                                              |
+| Studio   | [Open in Studio](https://studio.genlayer.com/?import-contract=0xaF9BF312d933d528C8a67794f0691f1754ef1Ec0) |
+| Explorer | [View on Explorer](https://explorer-studio.genlayer.com/address/0xaF9BF312d933d528C8a67794f0691f1754ef1Ec0) |
 
 ---
 
