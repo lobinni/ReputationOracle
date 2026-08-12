@@ -56,7 +56,7 @@ The property that only GenLayer provides: **N independent validators each fetch 
 | Anti-pattern | Why this is not that |
 |---|---|
 | _"An AI app with GenLayer attached"_ | The output is not advice, a recommendation or a summary for a human to read. It is a typed state transition — a score integer, a confidence level, a structured signal diff — consumed programmatically by other contracts. In `examples/defi_risk_gate.py` it unlocks a withdrawal. |
-| _"A validator that only checks output format"_ | Neither equivalence principle looks at shape. Round 1 requires validators to agree that two signal sets carry the same **information**; round 2 requires the score and confidence to **match exactly**. Valid JSON with a different verdict fails consensus. |
+| _"A validator that only checks output format"_ | Neither equivalence principle checks shape. Round 1 requires validators to agree that two signal sets carry the same **information**; round 2 requires the score and confidence to **match exactly**. Valid JSON with a different verdict fails consensus. |
 | _"Judging facts from user-submitted text"_ | No fact about the world is ever accepted from a caller. The only things a caller supplies are entity name and URL, and the URL is **immutable after creation** — there is no `set_url`. Every recorded signal was extracted by the contract, from its own stored URL, inside a consensus block. |
 | _"A thin LLM wrapper"_ | The model is one step of five. Around it sit anchored canonicalization, a deterministic digest gate, a scoring ladder, monotonic owner constraints, failure semantics that never mutate state, and a subscriber fan-out. Remove the consensus and the contract has no reason to exist; remove the surrounding machinery and the consensus is unusable. |
 
@@ -80,6 +80,7 @@ This matters as much as the list above. Every non-deterministic operation is a c
 
 - **The change decision itself.** `digest(signals) == stored_digest` is plain Keccak256 over a sorted signal list, computed outside every consensus block. When a page has not moved, "nothing changed" is a _deterministic_ answer that no model participates in.
 - **Access control.** Ownership checks, the monotonic `min_alert_score` and `cooldown` constraints, the paused check.
+- **The scored flag.** Whether a profile has received its first consensus-agreed score is a boolean, set once, never cleared.
 - **Cooldown arithmetic.** Timestamp parsing and comparison.
 - **The score gate.** `new_score != old_score` is an integer comparison, not a judgement.
 - **Storage, events, and subscriber fan-out.** Including which subscribers clear their own floor.
@@ -89,7 +90,7 @@ The shape to notice: **the model is asked what the sources say, never what the c
 
 ### Ordering discipline
 
-Inside `assess`, all deterministic guards run _before_ the first consensus block — profile exists, not paused, cooldown elapsed. A caller who fails a guard never spends a consensus round. The digest gate then sits _between_ the two rounds, so unchanged sources cost one round instead of two.
+Inside `assess`, all deterministic guards run _before_ the first consensus block — profile exists, not paused, cooldown elapsed. A caller who fails a guard never spends a consensus round. The digest gate then sits _between_ the two rounds, so unchanged sources cost one round instead of two — but only after the profile has been scored at least once (unscored profiles always run round 2 so they receive their initial score).
 
 ### Does the deterministic logic weaken the case for consensus?
 
@@ -131,19 +132,21 @@ Each `assess()` runs a two-round pipeline.
                                        │
                     ┌──────────────────▼───────────────────────┐
                     │ DETERMINISTIC GATE                       │
-                    │   digest(signals) == stored digest?      │
-                    │   yes → done. no second round, no spend. │
+                    │   scored AND digest unchanged?           │
+                    │   yes → done. no second round.           │
+                    │   no  → must run round 2                 │
                     └──────────────────┬───────────────────────┘
-                                       │ changed
+                                       │ needs scoring
                     ┌──────────────────▼───────────────────────┐
                     │ ROUND 2 (nondet: LLM)                    │
                     │   score reputation against criteria      │
                     │   → score 1..5 + confidence 1..3         │
                     │   EP: identical score verdict            │
                     └──────────────────┬───────────────────────┘
-                                       │ score changed
+                                       │
                     ┌──────────────────▼───────────────────────┐
-                    │ version++, history, subscriber callbacks │
+                    │ version++, scored=True, history,          │
+                    │ subscriber callbacks                     │
                     └──────────────────────────────────────────┘
 ```
 
@@ -185,11 +188,30 @@ payload = json.dumps(normalised, separators=(",", ":"), ensure_ascii=False)
 return Keccak256(payload.encode("utf-8")).hexdigest()
 ```
 
-If it matches the stored digest, nothing changed: the second round is skipped entirely. Unchanged sources cost one round rather than two, and the "no change" answer is perfectly deterministic — no model involved.
+If it matches the stored digest **and the profile has already been scored**, nothing changed: the second round is skipped entirely. Unchanged, already-scored profiles cost one round rather than two, and the "no change" answer is perfectly deterministic — no model involved.
+
+### The scored flag
+
+A newly created profile has `scored = False`. It is **not `reliable`** until its first `assess()` completes the scoring round. This is deliberate: a profile with `score = 0` (UNKNOWN) and no consensus-agreed score should never be treated as a trustworthy signal. Silence from an unscored profile means "we do not know yet", never "the reputation is zero".
+
+The first `assess()` call always runs round 2 regardless of the digest gate, so the profile receives its initial consensus-agreed score and transitions to `scored = True` (emitting `ProfileScored`). After that, the digest gate operates normally — unchanged pages skip round 2.
+
+The lifecycle of a profile is therefore:
+
+```
+create_profile()    scored=False  reliable=False  score=0
+       │
+       ▼
+assess() (1st)     scored=True   reliable=True   score=1..5
+       │
+       ▼
+assess() (2nd+)    digest gate: unchanged → skip round 2
+                                 changed   → run round 2
+```
 
 ### Round 2 — reputation scoring
 
-Only when the signal set actually moved. The diff is scored against the profile's natural-language criteria:
+Only when the signal set actually moved, **or the profile has not yet been scored**. The diff is scored against the profile's natural-language criteria:
 
 | Score | Meaning |
 |---|---|
@@ -202,12 +224,6 @@ Only when the signal set actually moved. The diff is scored against the profile'
 Only changes that affect the score bump the version, append to history, and notify subscribers.
 
 Note what happens on a score that **did not change**: no event fires, but **the snapshot still advances**. Otherwise every later diff is measured against increasingly stale text and the drift compounds until everything looks material.
-
-### The scored flag
-
-A newly created profile has `scored = False`. It is **not `reliable`** until its first `assess()` completes the scoring round. This is deliberate: a profile with `score = 0` (UNKNOWN) and no consensus-agreed score should never be treated as a trustworthy signal. Silence from an unscored profile means "we do not know yet", never "the reputation is zero".
-
-The first `assess()` call always runs round 2 regardless of the digest gate, so the profile receives its initial consensus-agreed score and transitions to `scored = True` (emitting `ProfileScored`). After that, the digest gate operates normally — unchanged pages skip round 2.
 
 ### Equivalence principles
 
@@ -222,6 +238,8 @@ Both rounds use `gl.eq_principle.prompt_comparative`, and neither could use `str
 ## Safety properties
 
 These are the design rules the contract holds to, each backed by a test.
+
+**An unscored profile is never reliable.** A newly created profile has `scored = False`. Until the first `assess()` completes the scoring round and sets `scored = True`, the profile reports `reliable = False` regardless of whether it is active. A consumer must never treat `score = 0` as a valid reputation signal — it means "no score yet", not "reputation is zero".
 
 **A failed fetch is never interpreted as "the content was removed."** The single most important property here. A downstream contract must never be told a signal vanished because of a 503. Failures increment a counter and emit `ProfileDegraded` after three consecutive misses; they never touch the snapshot.
 
@@ -262,7 +280,7 @@ The one residual power is pausing. It is deliberately not removed — blocking i
 ```python
 state = oracle.view().get_profile(profile_id)
 if not state["reliable"]:
-    ...   # paused or degraded: we do not know, so do not assume stability
+    ...   # unscored, paused, or degraded: do not assume stability
 ```
 
 **Silence from an unreliable profile means "we do not know", never "nothing changed."** The `reliable` flag is `active and scored and not degraded`. An unscored profile is never reliable, regardless of whether it is active.
@@ -297,7 +315,7 @@ What a consumer never has to learn: how to write an equivalence principle, why `
 | **One deployment, many profiles, many subscribers** | Shared infrastructure. Consumers do not deploy their own copy; they call `create_profile` or `subscribe` on an existing one. Costs and the source-reputation of a profile amortise across everyone using it. |
 | **An event source** | Deliberately the most composable output shape available. A push callback plus a pull-readable `version` means both reactive and polling consumers work without the contract knowing anything about them. |
 | **Safe-by-default trust model** | A consumer does not have to audit the profile owner. The owner's powers are constrained _by the contract_ — `min_alert_score` may only be raised, `cooldown` may only be lowered, `url` and `criteria` have no setter, and the subscriber picks its own alert floor. Reuse is only real if integrating does not require trusting whoever set the profile up. |
-| **Honest failure surface** | One `reliable` flag covers both pausing and degradation. A consumer has exactly one thing to check before treating silence as stability. |
+| **Honest failure surface** | One `reliable` flag covers unscored, pausing, and degradation. A consumer has exactly one thing to check before treating silence as stability. |
 | **Typed interface** | `IReputationSubscriber` and `IReputationOracle` are importable stubs; integration is autocompleted and type-checked rather than stringly-typed. |
 
 ### Who would actually use it
@@ -326,9 +344,34 @@ Reuse claims should come with the cases where reuse is a bad idea:
 
 ## Using it
 
+### Creating a profile
+
+```python
+# In GenLayer Studio:
+create_profile(
+    entity_name="Uniswap Protocol",
+    url="https://uniswap.org/",
+    criteria="Evaluate DeFi protocol trustworthiness based on security audits and governance",
+    min_alert_score=3,
+    cooldown_seconds=3600
+)
+# → returns profile_id
+# → profile is NOT reliable yet (scored=False)
+```
+
+### First assessment (required before the profile is reliable)
+
+```python
+# Anyone can call assess — it is permissionless
+assess(profile_id)
+# → runs round 1 (fetch + extract) AND round 2 (score)
+# → sets scored=True, reliable=True (if active and not degraded)
+# → emits ProfileScored and ReputationChanged
+```
+
 ### As a subscriber
 
-Implement one method and call `subscribe`. See [`examples/defi_risk_gate.py`](examples/defi_risk_gate.py) for a complete worked example — a DeFi collateral gate that unlocks when a counterparty's reputation drops.
+Implement one method and call `subscribe`. See [`examples/defi_risk_gate.py`](examples/defi_risk_gate.py) for a complete worked example.
 
 ```python
 @gl.public.write
@@ -363,12 +406,12 @@ oracle = IReputationOracle(oracle_address)
 state = oracle.view().get_profile(profile_id)
 
 if not state["reliable"]:
-    ...            # paused or degraded; do not treat silence as stability
+    ...            # unscored, paused, or degraded; do not treat silence as stability
 elif state["score"] < 3:
     ...            # reputation below threshold
 ```
 
-Always check `reliable` before treating an absence of events as evidence that nothing changed.
+Always check `reliable` before treating an absence of events as evidence that nothing changed. An unscored profile is never reliable.
 
 ---
 
@@ -378,8 +421,8 @@ Always check `reliable` before treating an absence of events as evidence that no
 
 | Method | |
 |---|---|
-| `create_profile(entity_name, url, criteria, min_alert_score=3, cooldown_seconds=3600)` | Register an entity and take its baseline assessment. Costs one observation round. |
-| `assess(profile_id)` | Re-assess and record any reputation change. **Permissionless** — anyone may pay to advance a profile. The cooldown, not an access check, bounds the cost. |
+| `create_profile(entity_name, url, criteria, min_alert_score=3, cooldown_seconds=3600)` → u256 | Register an entity and take its baseline signal snapshot. The profile is **not reliable** until the first `assess()`. Costs one observation round. |
+| `assess(profile_id)` | Re-assess and record any reputation change. **Permissionless** — anyone may pay to advance a profile. The first call always runs the scoring round and transitions the profile to `scored=True`. |
 
 ### Subscriptions
 
@@ -398,9 +441,13 @@ There is deliberately no `set_entity_name`, no `set_criteria`, and no `set_url`.
 
 `get_profile` · `get_signals` · `get_sources` · `get_history` · `get_latest_assessment` · `get_subscribers` · `is_due` · `profile_count`
 
+The `get_profile` view returns a `scored` boolean and a `reliable` boolean. `reliable` is `active and scored and not degraded`. Consumers must check `reliable` before acting on the score.
+
 ### Events
 
 `ProfileCreated` · `ProfileAssessed` · `ReputationChanged` · `ProfileScored` · `ProfileDegraded` · `ProfileActiveChanged` · `ProfileSensitivityChanged`
+
+`ProfileScored` is emitted exactly once per profile — on the first `assess()` that produces a consensus-agreed score. After that, score changes are reported via `ReputationChanged`.
 
 ---
 
@@ -430,12 +477,13 @@ gltest tests/integration/ -v -s --network studionet
 
 ### Test coverage
 
-27 direct tests. The adversarial cases are the point of the suite; anyone can test a happy path.
+27+ direct tests. The adversarial cases are the point of the suite; anyone can test a happy path.
 
 | Area | Cases |
 |---|---|
 | Signal canonicalization | digest determinism, order-independence, deduplication, sorting, bounds capping, polarity validation |
-| Deterministic gate | identical signals skip the scoring round |
+| Deterministic gate | identical signals skip the scoring round (only after scored) |
+| Scored flag | new profile is not reliable; first assess sets scored=True; unscored profile forces round 2 |
 | Observation packing | valid extraction packed, malformed output → error envelope (not exception) |
 | Verdict packing | valid verdict, score clamping, confidence clamping, missing fields |
 | Score & confidence | constants ordering, non-integer handling, boundary values |
@@ -456,7 +504,7 @@ tests/conftest.py                test configuration and fixtures
 
 ## Status
 
-Lint clean. **27 direct tests pass.**
+Lint clean. **27+ direct tests pass.**
 
 ### Deployed
 
@@ -464,7 +512,7 @@ Lint clean. **27 direct tests pass.**
 |---|---|
 | Network | StudioNet (chain id 61999) |
 | Address | `0xbC8EeE983F4bD14738a293156D1f67342dC7C134` |
-| Studio | https://explorer-studio.genlayer.com/address/0xbC8EeE983F4bD14738a293156D1f67342dC7C134 |
+| Studio | https://studio.genlayer.com/?import-contract=0xbC8EeE983F4bD14738a293156D1f67342dC7C134 |
 | Explorer | https://explorer-studio.genlayer.com/address/0xbC8EeE983F4bD14738a293156D1f67342dC7C134 |
 
 ### Observed consensus behaviour
@@ -476,3 +524,21 @@ Stated plainly, because anyone building on this should know it before they hit i
 - Deterministic writes (`subscribe`, `set_active`, `transfer_profile`, …) do not have this behaviour. Only `create_profile` and `assess` enter a consensus block.
 
 Treat the two non-deterministic writes as **retryable**, not as guaranteed-first-attempt. A failed consensus round is safe — it is indistinguishable from never having called.
+
+---
+
+## Changelog
+
+### v0.2.0 — Scored flag fix
+
+**Problem:** `create_profile` stored baseline signals but left `score = 0` while reporting the profile as `reliable = True`. The score `0` (UNKNOWN) is not a consensus-agreed value — it means "no score yet", not "reputation is zero". A consumer treating `reliable = True` and `score = 0` as a valid signal would be acting on meaningless data.
+
+**Fix:** Added a `scored: bool` field to `Profile`. The new semantics:
+
+- `create_profile` sets `scored = False`. The profile is **not reliable**.
+- The first `assess()` always runs round 2 (scoring), regardless of the digest gate, and transitions the profile to `scored = True`.
+- `reliable` is now `active AND scored AND not degraded`. An unscored profile is never reliable.
+- A new event `ProfileScored` is emitted exactly once per profile — on the first scoring.
+- After the first scoring, the digest gate operates normally: unchanged pages skip round 2.
+
+**Migration:** Consumers should already be gating on `reliable`. No code change is required — the `reliable` flag now correctly reports `False` for unscored profiles, which is the behaviour consumers should already expect. The only visible change is that `get_profile` now returns a `scored` boolean, and `reliable` has an additional `scored` conjunct.
